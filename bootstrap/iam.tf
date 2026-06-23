@@ -30,11 +30,17 @@ resource "aws_iam_access_key" "ci_pipeline" {
 # Policy: state backend access
 # Scoped to exactly the bucket/table this project's root module
 # uses for remote state — not "all S3" or "all DynamoDB."
+#
+# Uses a customer-managed policy (rather than an inline policy)
+# because inline policies on IAM users are capped at 2048 bytes —
+# easy to exceed once several services are scoped individually.
+# Managed policies cap at 6144 bytes and are independently visible
+# in the IAM console, which is also just a cleaner pattern.
 # ---------------------------------------------------------------
 
-resource "aws_iam_user_policy" "ci_state_backend" {
-  name = "CIStateBackendAccess"
-  user = aws_iam_user.ci_pipeline.name
+resource "aws_iam_policy" "ci_state_backend" {
+  name        = "CIStateBackendAccess"
+  description = "Allows the CI/CD user to read/write Terraform remote state and acquire/release the DynamoDB lock"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -69,6 +75,11 @@ resource "aws_iam_user_policy" "ci_state_backend" {
   })
 }
 
+resource "aws_iam_user_policy_attachment" "ci_state_backend" {
+  user       = aws_iam_user.ci_pipeline.name
+  policy_arn = aws_iam_policy.ci_state_backend.arn
+}
+
 # ---------------------------------------------------------------
 # Policy: application resource management
 # Scoped by name pattern to this project's specific resources.
@@ -77,9 +88,9 @@ resource "aws_iam_user_policy" "ci_state_backend" {
 # don't exist before the first apply.
 # ---------------------------------------------------------------
 
-resource "aws_iam_user_policy" "ci_app_resources" {
-  name = "CIAppResourceManagement"
-  user = aws_iam_user.ci_pipeline.name
+resource "aws_iam_policy" "ci_app_resources" {
+  name        = "CIAppResourceManagement"
+  description = "Allows the CI/CD user to manage this project's specific S3 bucket, Lambda function, SNS topic, and the Lambda's IAM role"
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -92,6 +103,7 @@ resource "aws_iam_user_policy" "ci_app_resources" {
           "s3:DeleteBucket",
           "s3:GetBucket*",
           "s3:PutBucket*",
+          "s3:GetAccelerateConfiguration",
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject",
@@ -109,6 +121,7 @@ resource "aws_iam_user_policy" "ci_app_resources" {
           "lambda:CreateFunction",
           "lambda:DeleteFunction",
           "lambda:GetFunction",
+          "lambda:GetFunctionCodeSigningConfig",
           "lambda:UpdateFunctionCode",
           "lambda:UpdateFunctionConfiguration",
           "lambda:AddPermission",
@@ -131,6 +144,7 @@ resource "aws_iam_user_policy" "ci_app_resources" {
           "sns:SetTopicAttributes",
           "sns:Subscribe",
           "sns:Unsubscribe",
+          "sns:GetSubscriptionAttributes",
           "sns:ListSubscriptionsByTopic",
           "sns:TagResource",
           "sns:UntagResource",
@@ -166,4 +180,9 @@ resource "aws_iam_user_policy" "ci_app_resources" {
       },
     ]
   })
+}
+
+resource "aws_iam_user_policy_attachment" "ci_app_resources" {
+  user       = aws_iam_user.ci_pipeline.name
+  policy_arn = aws_iam_policy.ci_app_resources.arn
 }
