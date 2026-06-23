@@ -105,6 +105,7 @@ resource "aws_iam_policy" "ci_app_resources" {
           "s3:PutBucket*",
           "s3:GetAccelerateConfiguration",
           "s3:GetLifecycleConfiguration",
+          "s3:GetReplicationConfiguration",
           "s3:GetObject",
           "s3:PutObject",
           "s3:DeleteObject",
