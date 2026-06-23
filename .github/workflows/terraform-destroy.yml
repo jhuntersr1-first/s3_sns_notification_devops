@@ -1,0 +1,65 @@
+name: Terraform Destroy
+
+# Deliberately NOT triggered by push or pull_request. This workflow
+# only runs when a human manually clicks "Run workflow" in the
+# Actions tab and types the confirmation phrase below. A destroy
+# workflow wired to push/PR events would let anyone who can merge
+# to main delete this stack as a side effect of an unrelated change.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "destroy" to confirm you want to tear down all infrastructure'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.7.5"
+  AWS_REGION: "us-east-1"
+
+jobs:
+  terraform-destroy:
+    name: Destroy infrastructure
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Verify confirmation phrase
+        if: ${{ github.event.inputs.confirm != 'destroy' }}
+        run: |
+          echo "Confirmation phrase did not match. Input was: '${{ github.event.inputs.confirm }}'"
+          echo "You must type exactly: destroy"
+          exit 1
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Empty the S3 bucket before destroy
+        run: |
+          BUCKET=$(terraform output -raw s3_bucket_name 2>/dev/null || echo "")
+          if [ -n "$BUCKET" ]; then
+            aws s3 rm "s3://$BUCKET" --recursive || true
+          fi
+
+      - name: Terraform destroy
+        run: terraform destroy -input=false -auto-approve
+        env:
+          TF_VAR_notification_email: ${{ secrets.NOTIFICATION_EMAIL }}
