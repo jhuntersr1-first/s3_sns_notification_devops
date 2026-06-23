@@ -40,6 +40,8 @@ The S3 bucket notification triggers the Lambda function on any object-creation e
 - Terraform-managed Lambda packaging (`archive_file` + `local_file`) without committing build artifacts to source control
 - CI/CD for infrastructure: GitHub Actions pipeline runs `fmt`, `init`, `validate`, and a Checkov security scan on every pull request, posts the plan output as a PR comment for review, and gates `apply` behind a merge to `main`
 - Remote state management with an S3 backend and DynamoDB state locking, provisioned through a self-contained bootstrap stack to avoid the chicken-and-egg problem of using Terraform to create its own backend
+- A least-privilege, custom-scoped IAM user for the CI/CD pipeline itself, built and iterated on as a managed policy (not an inline policy, which hits a 2048-byte size ceiling on IAM users)
+- A manually-gated destroy workflow (`workflow_dispatch` with a typed confirmation phrase) — deliberately not wired to `push` or `pull_request`, since an automatic destroy trigger would let anyone who can merge to `main` tear down the stack as a side effect
 
 ## Repository Structure
 
@@ -48,15 +50,19 @@ The S3 bucket notification triggers the Lambda function on any object-creation e
 ├── .github/
 │   └── workflows/
 │       ├── terraform-ci.yml      # PR checks: fmt, validate, Checkov, plan
-│       └── terraform-apply.yml   # Deploy on merge to main
-├── bootstrap/                    # One-time setup for remote state backend
+│       ├── terraform-apply.yml   # Deploy on merge to main
+│       └── terraform-destroy.yml # Manual, confirmation-gated teardown
+├── bootstrap/                    # One-time setup for remote state backend + CI IAM user
 │   ├── main.tf                   # S3 bucket + DynamoDB lock table
+│   ├── iam.tf                    # Scoped IAM user/policies for the CI/CD pipeline
 │   ├── variables.tf
 │   └── outputs.tf
 ├── main.tf            # Provider, version constraints, S3 backend config, data sources
 ├── variables.tf        # Input variable definitions
 ├── s3.tf               # S3 bucket, public access block, event notification
-├── lambda.tf           # Lambda source, IAM role/policies, function resource
+├── lambda.tf           # Lambda IAM role/policies, function resource
+├── lambda/
+│   └── sns_notify.py   # Lambda source code (zipped by the archive provider)
 ├── sns.tf              # SNS topic, topic policy, email subscription
 ├── outputs.tf          # Output values (bucket name, ARNs, subscription reminder)
 ├── .gitignore
@@ -102,7 +108,7 @@ This is the fastest way to test the stack directly. For the intended deployment 
 
 This repo is designed to deploy through GitHub Actions rather than repeated local `terraform apply` runs. Set this up once, in order:
 
-### 1. Provision the remote state backend
+### 1. Provision the remote state backend and CI IAM user
 
 ```bash
 cd bootstrap
@@ -110,9 +116,17 @@ terraform init
 terraform apply
 ```
 
-This creates an S3 bucket (versioned, encrypted, public access blocked) and a DynamoDB table for state locking. Keep this stack's own state local — don't add a backend block to it, or you recreate the exact chicken-and-egg problem it exists to solve.
+This creates an S3 bucket (versioned, encrypted, public access blocked) and a DynamoDB table for state locking, plus a dedicated IAM user (`github-actions-s3-sns-lambda-ci`) with two scoped managed policies — one for state backend access, one for managing this project's specific S3 bucket, Lambda function, SNS topic, and the Lambda's IAM role by exact name. Keep this stack's own state local — don't add a backend block to it, or you recreate the exact chicken-and-egg problem it exists to solve.
 
 If you change `state_bucket_name` or `lock_table_name` from the defaults in `bootstrap/variables.tf`, update the matching values in the `backend "s3"` block in the root `main.tf`.
+
+Retrieve the CI user's credentials:
+```bash
+terraform output ci_access_key_id
+terraform output -raw ci_secret_access_key
+```
+
+> **Note:** least-privilege scoping for Lambda, S3, and IAM was arrived at empirically — the Terraform AWS provider checks several read-only "describe" actions during every `plan`/`apply` refresh (e.g. `s3:GetAccelerateConfiguration`, `s3:GetLifecycleConfiguration`, `lambda:GetFunctionCodeSigningConfig`) that aren't obvious from the resource's configured attributes alone. Expect a tight policy to need a round or two of "access denied → add the specific action" iteration before it's fully quiet.
 
 ### 2. Migrate the root module to remote state
 
@@ -128,15 +142,15 @@ Under **Settings → Secrets and variables → Actions**, add:
 
 | Secret | Value |
 |---|---|
-| `AWS_ACCESS_KEY_ID` | Access key for an IAM identity scoped to this project's resources |
-| `AWS_SECRET_ACCESS_KEY` | Corresponding secret key |
+| `AWS_ACCESS_KEY_ID` | `ci_access_key_id` output from the bootstrap stack |
+| `AWS_SECRET_ACCESS_KEY` | `ci_secret_access_key` output from the bootstrap stack |
 | `NOTIFICATION_EMAIL` | Email address that should receive S3 upload notifications |
 
-> Scope these credentials to only what this stack needs (S3, Lambda, SNS, IAM role/policy management, plus S3/DynamoDB access for the state backend) rather than reusing broad admin credentials.
+> A missing or misspelled secret name fails silently — GitHub Actions substitutes an empty string rather than erroring, which can be dangerous for values like `notification_email` (an empty value would force-replace the live SNS subscription rather than just failing the run). Always check the masked `***` appears for every expected secret in the workflow's env dump before trusting a run.
 
 ### 4. (Optional) Add a manual approval gate on apply
 
-`terraform-apply.yml` targets a GitHub **environment** named `production`. Create one under **Settings → Environments** and add required reviewers if you want a human approval step between merge and apply, even though the merge has already happened.
+`terraform-apply.yml` and `terraform-destroy.yml` both target a GitHub **environment** named `production`. Create one under **Settings → Environments** and add required reviewers if you want a human approval step between trigger and execution.
 
 ### Pipeline behavior
 
@@ -144,8 +158,9 @@ Under **Settings → Secrets and variables → Actions**, add:
 |---|---|---|
 | Pull request opened/updated against `main` | `terraform-ci.yml` | `fmt -check`, `init`, `validate`, Checkov scan, `plan` — results posted as a PR comment |
 | Push/merge to `main` | `terraform-apply.yml` | `init`, `apply -auto-approve` (gated by the `production` environment if configured) |
+| Manual only — Actions tab → "Run workflow" | `terraform-destroy.yml` | Requires typing `destroy` as input; empties the S3 bucket, then `destroy -auto-approve` |
 
-`apply` never runs on a pull request, only on `main` after merge — so every infrastructure change is visible as a reviewed plan before it executes.
+`apply` never runs on a pull request, only on `main` after merge — so every infrastructure change is visible as a reviewed plan before it executes. `destroy` never runs automatically under any circumstance — see [Cleanup](#cleanup) below for why it's deliberately manual-only.
 
 ## Inputs
 
@@ -180,7 +195,11 @@ Under **Settings → Secrets and variables → Actions**, add:
    ```
 4. Within 15–30 seconds, check the inbox for the configured `notification_email`. The message includes the bucket name, object key, size, region, event type, and a direct console link to the file.
 
-For troubleshooting, inspect Lambda execution logs in **CloudWatch → Log groups → `/aws/lambda/S3ToSNSLambda`**.
+For troubleshooting, inspect Lambda execution logs in **CloudWatch → Log groups → `/aws/lambda/S3ToSNSLambda`**:
+```bash
+aws logs tail /aws/lambda/S3ToSNSLambda --since 1h
+```
+> On Git Bash / MINGW64 (Windows), a leading `/` in CLI arguments can get mangled by path translation, causing a confusing `InvalidParameterException` even on syntactically correct commands. Prefix with `MSYS_NO_PATHCONV=1` if you see that error on an otherwise-correct AWS CLI call.
 
 | Symptom | Likely Cause | Resolution |
 |---|---|---|
@@ -189,32 +208,45 @@ For troubleshooting, inspect Lambda execution logs in **CloudWatch → Log group
 | Lambda execution error | IAM permissions issue | Confirm `aws_iam_role_policy_attachment.lambda_basic` and `aws_iam_role_policy.lambda_sns_publish` applied without error |
 | Lambda not triggered | Event notification misconfigured | Confirm `aws_s3_bucket_notification.trigger_lambda` applied and `aws_lambda_permission.allow_s3_invoke` exists before it |
 | SNS publish error | Topic policy too restrictive | Verify the `aws:SourceArn` condition in `sns.tf` matches the deployed Lambda function ARN |
+| CI pipeline: `AccessDenied` on a `Get*`/describe action | CI IAM policy missing a read-only permission the provider checks during refresh | Add the specific action named in the error to `bootstrap/iam.tf`'s `ci_app_resources` policy, then `terraform apply` in `bootstrap/` |
+| CI pipeline: `LimitExceeded... Maximum policy size` | Inline IAM policy exceeded 2048 bytes | Already resolved in this repo by using `aws_iam_policy` (managed) + `aws_iam_user_policy_attachment` instead of `aws_iam_user_policy` (inline) |
 
 ## Cleanup
 
-```bash
-terraform destroy -var="notification_email=you@example.com"
-```
+There are two ways to tear down the root module's resources (the S3 bucket, Lambda function, SNS topic, and related IAM role — **not** the bootstrap stack's state backend or CI user, which are left running deliberately; see below).
 
-This removes all resources provisioned by this module, including the S3 bucket. Note that `aws_s3_bucket` will fail to delete if the bucket still contains objects — empty it first if you uploaded test files:
+### Option A — Local
+
 ```bash
 aws s3 rm s3://$(terraform output -raw s3_bucket_name)/ --recursive
+terraform destroy -var="notification_email=you@example.com"
 ```
+The bucket must be emptied first — `aws_s3_bucket` destroy fails if the bucket still contains objects.
+
+### Option B — GitHub Actions (manual trigger)
+
+Go to the **Actions** tab → **Terraform Destroy** (left sidebar) → **Run workflow** → type `destroy` in the confirmation field → **Run workflow**.
+
+This workflow runs on `workflow_dispatch` only — it is **never** triggered by a push or pull request. A destroy wired to those events would let anyone who can merge to `main` delete the stack as a side effect of an unrelated change; requiring a human to manually trigger it and type a confirmation phrase is a deliberate guardrail, not an oversight. The workflow empties the S3 bucket automatically before running `terraform destroy -auto-approve`.
+
+### Bootstrap stack (state backend + CI IAM user)
+
+Left running by design in normal use — it's cheap (DynamoDB pay-per-request, a near-empty S3 bucket) and re-running the root module later doesn't require redoing any backend setup. If you do want to tear it down (e.g. permanently retiring the project), do it manually, last, from `bootstrap/`:
+```bash
+cd bootstrap
+terraform destroy
+```
+This is intentionally **not** automatable from CI — a pipeline should never be able to delete the identity and state backend that controls it.
 
 ## Future Improvements
 
 - Add a dead-letter queue (DLQ) for failed Lambda invocations
 - Move the SNS topic ARN and other identifiers to AWS Systems Manager Parameter Store or Secrets Manager rather than plain environment variables
 - Support multiple notification protocols (SMS, Slack webhook via a second Lambda) in addition to email
-- Migrate AWS authentication from static GitHub Secrets to OIDC role assumption, removing long-lived credentials from the pipeline entirely
+- Migrate AWS authentication from static GitHub Secrets to OIDC role assumption (`AssumeRoleWithWebIdentity`), removing the long-lived IAM access key from the pipeline entirely
 - Add `terraform plan` drift detection on a schedule (e.g. nightly) to catch manual out-of-band changes
 - Pin the Checkov and Terraform provider versions more tightly, and add `tflint` as a complementary static-analysis step
 
 ## Acknowledgments
 
 Lambda notification logic originally adapted from [Derrick](https://github.com/derrickSh43/SNSfromS3withLambda/blob/main/SNS.py).
-
-## License
-
-MIT
-# s3_sns_notification_devops
